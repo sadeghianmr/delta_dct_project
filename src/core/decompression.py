@@ -1,35 +1,9 @@
 import pywt
 import torch
+import torch.nn.functional as F
 from typing import List, Tuple
 from scipy.fftpack import idctn
-
-def dequantize_and_idct_patches(
-    quantized_patches: List[torch.Tensor],
-    min_vals: torch.Tensor,
-    max_vals: torch.Tensor,
-    bit_allocations: torch.Tensor
-) -> torch.Tensor:
-    """
-    Performs de-quantization and Inverse DCT on a list of compressed patches.
-    """
-    reconstructed_patches_list = []
-    for i in range(len(quantized_patches)):
-        quantized_patch, bits = quantized_patches[i].float(), bit_allocations[i].item()
-        min_val, max_val = min_vals[i], max_vals[i]
-
-        if bits > 0:
-            if min_val == max_val:
-                dequantized_dct = torch.full_like(quantized_patch, min_val)
-            else:
-                normalized = quantized_patch / (2**bits - 1)
-                dequantized_dct = normalized * (max_val - min_val) + min_val
-        else: # bits == 0
-            dequantized_dct = torch.full_like(quantized_patch, min_val)
-            
-        reconstructed_patch = torch.from_numpy(idctn(dequantized_dct.numpy(), type=2, norm='ortho'))
-        reconstructed_patches_list.append(reconstructed_patch)
-        
-    return torch.stack(reconstructed_patches_list)
+from typing import List, Tuple, Optional
 
 def patches_to_tensor(
     reconstructed_patches: torch.Tensor,
@@ -58,28 +32,57 @@ def final_rescale(reconstructed_tensor: torch.Tensor, original_mean_abs: float) 
     return reconstructed_tensor * scale_factor
 
 
+def dequantize_and_idct_patches(
+    quantized_patches: List[torch.Tensor],
+    min_vals: torch.Tensor,
+    max_vals: torch.Tensor,
+    bit_allocations: torch.Tensor,
+    q_table: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Performs de-quantization and Inverse DCT, with optional JPEG-style table."""
+    reconstructed_patches_list = []
+    for i in range(len(quantized_patches)):
+        quantized_patch, bits = quantized_patches[i].float(), bit_allocations[i].item()
+        min_val, max_val = min_vals[i], max_vals[i]
+        dequantized_dct = torch.full_like(quantized_patch, 0.0)
+
+        if bits > 0:
+            if min_val == max_val:
+                dequantized_dct = torch.full_like(quantized_patch, min_val)
+            else:
+                normalized = quantized_patch / (2**bits - 1)
+                dequantized_dct = normalized * (max_val - min_val) + min_val
+        else:
+            dequantized_dct = torch.full_like(quantized_patch, min_val)
+        
+        # --- NEW: Apply JPEG quantization table if provided ---
+        if q_table is not None:
+            # print(f"DEBUG: Applying INVERSE JPEG Quantization in IDCT...") # DEBUG PRINT
+
+            dequantized_dct = dequantized_dct * q_table
+
+        reconstructed_patch = torch.from_numpy(idctn(dequantized_dct.numpy(), type=2, norm='ortho'))
+        reconstructed_patches_list.append(reconstructed_patch)
+        
+    return torch.stack(reconstructed_patches_list)
+
 def dequantize_and_idwt_patches(
     quantized_patches: List[torch.Tensor],
     min_vals: torch.Tensor,
     max_vals: torch.Tensor,
     bit_allocations: torch.Tensor,
-    original_patch_size: int
+    original_patch_size: int,
+    q_table: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """
-    Performs de-quantization and Inverse DWT on a list of compressed patches.
-    """
+    """Performs de-quantization and Inverse DWT, with optional JPEG-style table."""
     reconstructed_patches_list = []
-    # For IDWT, detail coefficients are needed. We'll approximate them with zeros.
-    # The size of detail coefficients depends on the wavelet and original size.
-    # For 'haar' DWT, the coefficient matrices are roughly half the size.
     coeff_shape = [s // 2 for s in (original_patch_size, original_patch_size)]
-    LH = torch.zeros(coeff_shape)
-    HL = torch.zeros(coeff_shape)
-    HH = torch.zeros(coeff_shape)
+    LH, HL, HH = torch.zeros(coeff_shape), torch.zeros(coeff_shape), torch.zeros(coeff_shape)
 
     for i in range(len(quantized_patches)):
         quantized_patch, bits = quantized_patches[i].float(), bit_allocations[i].item()
         min_val, max_val = min_vals[i], max_vals[i]
+        dequantized_ll = torch.full_like(quantized_patch, 0.0)
 
         if bits > 0:
             if min_val == max_val:
@@ -87,21 +90,27 @@ def dequantize_and_idwt_patches(
             else:
                 normalized = quantized_patch / (2**bits - 1)
                 dequantized_ll = normalized * (max_val - min_val) + min_val
-        else: # bits == 0
+        else:
             dequantized_ll = torch.full_like(quantized_patch, min_val)
 
-        # Reconstruct with zeroed detail coefficients
+        # --- NEW: Apply JPEG quantization table if provided ---
+        if q_table is not None:
+            # print(f"DEBUG: Applying INVERSE JPEG Quantization in IDWT...") # DEBUG PRINT
+
+            dwt_patch_size = dequantized_ll.shape[0]
+            if q_table.shape[0] != dwt_patch_size:
+                resized_q_table = F.interpolate(q_table.view(1, 1, *q_table.shape), size=(dwt_patch_size, dwt_patch_size), mode='bilinear').squeeze().clamp(min=1.0)
+            else:
+                resized_q_table = q_table
+            dequantized_ll = dequantized_ll * resized_q_table
+            
         coeffs = dequantized_ll.numpy(), (LH.numpy(), HL.numpy(), HH.numpy())
         reconstructed_patch = torch.from_numpy(pywt.idwt2(coeffs, 'haar'))
-        
-        # Resize to original patch size if necessary due to odd dimensions
-        reconstructed_patch = torch.nn.functional.interpolate(
-            reconstructed_patch.unsqueeze(0).unsqueeze(0), 
-            size=(original_patch_size, original_patch_size), 
-            mode='bilinear', 
-            align_corners=False
-        ).squeeze(0).squeeze(0)
-
+        reconstructed_patch = F.interpolate(
+            reconstructed_patch.unsqueeze(0).unsqueeze(0),
+            size=(original_patch_size, original_patch_size),
+            mode='bilinear', align_corners=False
+        ).squeeze()
         reconstructed_patches_list.append(reconstructed_patch)
         
     return torch.stack(reconstructed_patches_list)

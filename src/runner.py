@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from typing import Dict, Any, Tuple
 
 from pipeline import compress_model, decompress_model
-from utils import calculate_delta_parameters, calculate_parameters_size, calculate_compressed_size
+from utils import calculate_delta_parameters, calculate_parameters_size, calculate_compressed_size, get_jpeg_quantization_table
 from evaluation import evaluate_accuracy
 
 # --- Helper Functions ---
@@ -61,21 +61,39 @@ def _perform_evaluations(ft_model, recon_model, pt_model, compressed_data, datal
 
 # --- Main Runner Function ---
 
+
+# In src/runner.py
+
+# In src/runner.py
+
 def run_classification_experiment(config: Dict[str, Any], device: str = "cpu") -> Dict[str, Any]:
-    """Runs a complete compression and classification experiment."""
+    """
+    Runs a complete experiment, now with debug prints for JPEG feature.
+    """
     print(f"\n{'='*20} Starting Experiment: {config['finetuned_model_id'].split('/')[-1]} {'='*20}")
     
     pt_model, ft_model = _load_models(config['model_class'], config['pretrained_model_id'], config['finetuned_model_id'])
     dataloader = _prepare_dataloader(config['task_info'], config['model_class'], config['pretrained_model_id'])
-
-    # Get transform_type from config, default to 'dct'
     transform_type = config.get("transform_type", "dct")
-
+    
+    use_jpeg_quant = config.get("use_jpeg_quantization", False)
+    q_table = None
+    if use_jpeg_quant:
+        print("DEBUG: JPEG Quantization Flag is TRUE. Creating table...") # DEBUG PRINT
+        q_table = get_jpeg_quantization_table(8)
+    
     compressed_data = compress_model(
         pt_model, ft_model, config['patch_size'],
-        config['bit_strategy'], transform_type=transform_type
+        config['bit_strategy'], transform_type=transform_type,
+        q_table=q_table
     )
-    reconstructed_model = decompress_model(pt_model, compressed_data)
+    
+    reconstructed_model = decompress_model(
+        pretrained_model=pt_model,
+        compressed_data=compressed_data,
+        original_finetuned_model=ft_model,
+        q_table_base=q_table
+    )
     
     metrics = _perform_evaluations(ft_model, reconstructed_model, pt_model, compressed_data, dataloader, torch.device(device))
     
@@ -86,10 +104,10 @@ def run_classification_experiment(config: Dict[str, Any], device: str = "cpu") -
     results = {
         "model_name": config['finetuned_model_id'].split('/')[-1],
         "transform": transform_type,
+        "jpeg_quant": use_jpeg_quant,
         "patch_size": config['patch_size'],
         "bit_strategy": str(config['bit_strategy']),
         **metrics
     }
-    
     print(f"{'='*20} Experiment Finished {'='*20}")
     return results
