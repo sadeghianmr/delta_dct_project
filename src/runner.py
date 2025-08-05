@@ -8,6 +8,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from typing import Dict, Any, Tuple
 
+# Import our project's modules
 from pipeline import compress_model, decompress_model
 from utils import calculate_delta_parameters, calculate_parameters_size, calculate_compressed_size, get_jpeg_quantization_table
 from evaluation import evaluate_accuracy
@@ -19,7 +20,12 @@ def _load_models(model_class: torch.nn.Module, base_id: str, finetuned_id: str) 
     print(f"Loading models: {base_id} and {finetuned_id}")
     finetuned_model = model_class.from_pretrained(finetuned_id)
     num_labels = finetuned_model.config.num_labels if hasattr(finetuned_model.config, 'num_labels') else 2
-    pretrained_model = model_class.from_pretrained(base_id, num_labels=num_labels, ignore_mismatched_sizes=True)
+    
+    pretrained_model = model_class.from_pretrained(
+        base_id,
+        num_labels=num_labels,
+        ignore_mismatched_sizes=True
+    )
     return pretrained_model, finetuned_model
 
 def _prepare_dataloader(task_info: Dict[str, Any], model_class: torch.nn.Module, base_model_id: str) -> DataLoader:
@@ -54,32 +60,31 @@ def _perform_evaluations(ft_model, recon_model, pt_model, compressed_data, datal
     compressed_delta_size = calculate_compressed_size(compressed_data)
     compression_ratio = original_delta_size / compressed_delta_size if compressed_delta_size > 0 else float('inf')
     return {
-        "original_accuracy": original_accuracy, "reconstructed_accuracy": reconstructed_accuracy,
-        "accuracy_drop": original_accuracy - reconstructed_accuracy, "original_delta_mb": original_delta_size,
-        "compressed_delta_mb": compressed_delta_size, "compression_ratio": compression_ratio
+        "original_accuracy": original_accuracy,
+        "reconstructed_accuracy": reconstructed_accuracy,
+        "accuracy_drop": original_accuracy - reconstructed_accuracy,
+        "original_delta_mb": original_delta_size,
+        "compressed_delta_mb": compressed_delta_size,
+        "compression_ratio": compression_ratio
     }
 
 # --- Main Runner Function ---
 
-
-# In src/runner.py
-
-# In src/runner.py
-
 def run_classification_experiment(config: Dict[str, Any], device: str = "cpu") -> Dict[str, Any]:
     """
-    Runs a complete experiment, now with debug prints for JPEG feature.
+    Runs a complete compression and classification experiment.
     """
     print(f"\n{'='*20} Starting Experiment: {config['finetuned_model_id'].split('/')[-1]} {'='*20}")
     
     pt_model, ft_model = _load_models(config['model_class'], config['pretrained_model_id'], config['finetuned_model_id'])
     dataloader = _prepare_dataloader(config['task_info'], config['model_class'], config['pretrained_model_id'])
+
     transform_type = config.get("transform_type", "dct")
     
     use_jpeg_quant = config.get("use_jpeg_quantization", False)
     q_table = None
     if use_jpeg_quant:
-        print("DEBUG: JPEG Quantization Flag is TRUE. Creating table...") # DEBUG PRINT
+        print("JPEG-style quantization ENABLED.")
         q_table = get_jpeg_quantization_table(8)
     
     compressed_data = compress_model(
@@ -109,5 +114,6 @@ def run_classification_experiment(config: Dict[str, Any], device: str = "cpu") -
         "bit_strategy": str(config['bit_strategy']),
         **metrics
     }
+    
     print(f"{'='*20} Experiment Finished {'='*20}")
     return results

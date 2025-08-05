@@ -1,9 +1,82 @@
-# In src/utils.py
-
 import torch
 import collections
 from torch.nn import Module
 import torch.nn.functional as F
+
+def calculate_delta_parameters(pretrained_model: Module, finetuned_model: Module) -> collections.OrderedDict:
+    """
+    Calculates the difference (delta) between the parameters of a fine-tuned model
+    and a pre-trained model, ensuring the output is always float.
+
+    Args:
+        pretrained_model (torch.nn.Module): The original pre-trained model.
+        finetuned_model (torch.nn.Module): The model after fine-tuning on a specific task.
+
+    Returns:
+        collections.OrderedDict: A dictionary where keys are layer names and values are the
+                                 float delta parameter tensors for each layer.
+    """
+    pretrained_state_dict = pretrained_model.state_dict()
+    finetuned_state_dict = finetuned_model.state_dict()
+    delta_weights = collections.OrderedDict()
+
+    for key in finetuned_state_dict.keys():
+        # The root fix: convert both tensors to float BEFORE subtraction.
+        delta = finetuned_state_dict[key].float() - pretrained_state_dict[key].float()
+        delta_weights[key] = delta
+        
+    return delta_weights
+
+def calculate_parameters_size(state_dict: collections.OrderedDict) -> float:
+    """
+    Calculates the total size of a model's state_dict in megabytes (MB).
+
+    Args:
+        state_dict (collections.OrderedDict): The state dictionary of a model or delta weights.
+
+    Returns:
+        float: The total size of the parameters in megabytes.
+    """
+    total_bytes = 0
+    for param in state_dict.values():
+        total_bytes += param.numel() * param.element_size()
+    return total_bytes / (1024 * 1024)
+
+def calculate_compressed_size(compressed_data: dict) -> float:
+    """
+    Calculates the total size of the compressed data structure in megabytes (MB).
+    This version correctly handles both compressed and uncompressed layers.
+
+    Args:
+        compressed_data (dict): The main dictionary containing all compressed layer data.
+
+    Returns:
+        float: The total size of the compressed data in megabytes.
+    """
+    total_bytes = 0
+    for layer_name, data in compressed_data.items():
+        if data.get('is_compressed'):
+            # Size of quantized patches
+            # The internal structure for DWT is a list of lists, so we handle it.
+            if isinstance(data['quantized_patches'][0], list): # DWT case
+                for patch_coeffs in data['quantized_patches']:
+                    for coeff_matrix in patch_coeffs:
+                        total_bytes += coeff_matrix.numel() # int8 is 1 byte
+            else: # DCT case
+                for patch in data['quantized_patches']:
+                    total_bytes += patch.numel() # int8 is 1 byte
+            
+            # Size of metadata (floats and ints)
+            total_bytes += data['min_vals'].numel() * data['min_vals'].element_size()
+            total_bytes += data['max_vals'].numel() * data['max_vals'].element_size()
+            total_bytes += data['bit_allocations'].numel() * data['bit_allocations'].element_size()
+        else:
+            # If not compressed, calculate the size of the stored uncompressed delta.
+            if 'uncompressed_delta' in data:
+                tensor = data['uncompressed_delta']
+                total_bytes += tensor.numel() * tensor.element_size()
+    
+    return total_bytes / (1024 * 1024)
 
 # Standard JPEG Luminance Quantization Table
 JPEG_QUANTIZATION_TABLE_8X8 = torch.tensor([
@@ -29,42 +102,12 @@ def get_jpeg_quantization_table(patch_size: int) -> torch.Tensor:
     """
     if patch_size == 8:
         return JPEG_QUANTIZATION_TABLE_8X8
+
     table_reshaped = JPEG_QUANTIZATION_TABLE_8X8.view(1, 1, 8, 8)
-    resized_table = F.interpolate(table_reshaped, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+    resized_table = F.interpolate(
+        table_reshaped,
+        size=(patch_size, patch_size),
+        mode='bilinear',
+        align_corners=False
+    )
     return resized_table.squeeze().clamp(min=1.0)
-
-
-def calculate_delta_parameters(pretrained_model: Module, finetuned_model: Module) -> collections.OrderedDict:
-    """Calculates the delta, ensuring the output is always float."""
-    pretrained_state_dict = pretrained_model.state_dict()
-    finetuned_state_dict = finetuned_model.state_dict()
-    delta_weights = collections.OrderedDict()
-
-    for key in finetuned_state_dict.keys():
-        # The root fix: convert both tensors to float BEFORE subtraction.
-        delta = finetuned_state_dict[key].float() - pretrained_state_dict[key].float()
-        delta_weights[key] = delta
-        
-    return delta_weights
-
-# ... (The other functions in this file, calculate_parameters_size and calculate_compressed_size, remain the same) ...
-def calculate_parameters_size(state_dict: collections.OrderedDict) -> float:
-    total_bytes = 0
-    for param in state_dict.values():
-        total_bytes += param.numel() * param.element_size()
-    return total_bytes / (1024 * 1024)
-
-def calculate_compressed_size(compressed_data: dict) -> float:
-    total_bytes = 0
-    for layer_name, data in compressed_data.items():
-        if data.get('is_compressed'):
-            for patch in data['quantized_patches']:
-                total_bytes += patch.numel()
-            total_bytes += data['min_vals'].numel() * data['min_vals'].element_size()
-            total_bytes += data['max_vals'].numel() * data['max_vals'].element_size()
-            total_bytes += data['bit_allocations'].numel() * data['bit_allocations'].element_size()
-        else:
-            if 'uncompressed_delta' in data:
-                tensor = data['uncompressed_delta']
-                total_bytes += tensor.numel() * tensor.element_size()
-    return total_bytes / (1024 * 1024)

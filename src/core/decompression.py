@@ -1,9 +1,8 @@
 import pywt
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple
+from typing import Dict, List, Tuple, Optional
 from scipy.fftpack import idctn
-from typing import List, Tuple, Optional
 
 def patches_to_tensor(
     reconstructed_patches: torch.Tensor,
@@ -67,50 +66,67 @@ def dequantize_and_idct_patches(
     return torch.stack(reconstructed_patches_list)
 
 def dequantize_and_idwt_patches(
-    quantized_patches: List[torch.Tensor],
-    min_vals: torch.Tensor,
-    max_vals: torch.Tensor,
+    quantized_coeffs_list: List[List[torch.Tensor]],
+    min_vals_tensor: torch.Tensor,
+    max_vals_tensor: torch.Tensor,
     bit_allocations: torch.Tensor,
     original_patch_size: int,
     q_table: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """Performs de-quantization and Inverse DWT, with optional JPEG-style table."""
+    """
+    Performs de-quantization and Inverse DWT using all four coefficient sets,
+    each potentially having a different bit-rate.
+    """
     reconstructed_patches_list = []
-    coeff_shape = [s // 2 for s in (original_patch_size, original_patch_size)]
-    LH, HL, HH = torch.zeros(coeff_shape), torch.zeros(coeff_shape), torch.zeros(coeff_shape)
 
-    for i in range(len(quantized_patches)):
-        quantized_patch, bits = quantized_patches[i].float(), bit_allocations[i].item()
-        min_val, max_val = min_vals[i], max_vals[i]
-        dequantized_ll = torch.full_like(quantized_patch, 0.0)
+    for i in range(len(quantized_coeffs_list)):
+        quantized_parts = quantized_coeffs_list[i]
+        allocated_bits_for_ll = bit_allocations[i].item()
+        min_vals = min_vals_tensor[i]
+        max_vals = max_vals_tensor[i]
+        
+        # Asymmetrical Bit-rate Logic (must match compression)
+        bits_for_parts = [allocated_bits_for_ll, 1, 1, 1]
 
-        if bits > 0:
-            if min_val == max_val:
-                dequantized_ll = torch.full_like(quantized_patch, min_val)
-            else:
-                normalized = quantized_patch / (2**bits - 1)
-                dequantized_ll = normalized * (max_val - min_val) + min_val
-        else:
-            dequantized_ll = torch.full_like(quantized_patch, min_val)
-
-        # --- NEW: Apply JPEG quantization table if provided ---
-        if q_table is not None:
-            # print(f"DEBUG: Applying INVERSE JPEG Quantization in IDWT...") # DEBUG PRINT
-
-            dwt_patch_size = dequantized_ll.shape[0]
-            if q_table.shape[0] != dwt_patch_size:
-                resized_q_table = F.interpolate(q_table.view(1, 1, *q_table.shape), size=(dwt_patch_size, dwt_patch_size), mode='bilinear').squeeze().clamp(min=1.0)
-            else:
-                resized_q_table = q_table
-            dequantized_ll = dequantized_ll * resized_q_table
+        dequantized_coeffs = []
+        for j in range(4): # Loop over LL, LH, HL, HH
+            quantized_patch = quantized_parts[j].float()
+            current_bits = bits_for_parts[j]
+            min_val, max_val = min_vals[j], max_vals[j]
             
-        coeffs = dequantized_ll.numpy(), (LH.numpy(), HL.numpy(), HH.numpy())
+            dequantized_part = torch.full_like(quantized_patch, 0.0)
+
+            if current_bits > 0:
+                if min_val == max_val:
+                    dequantized_part = torch.full_like(quantized_patch, min_val)
+                else:
+                    normalized = quantized_patch / (2**current_bits - 1)
+                    dequantized_part = normalized * (max_val - min_val) + min_val
+            else:
+                dequantized_part = torch.full_like(quantized_patch, min_val)
+
+            if q_table is not None:
+                coeff_size = dequantized_part.shape[0]
+                if q_table.shape[0] != coeff_size:
+                    resized_q_table = F.interpolate(q_table.view(1, 1, *q_table.shape), size=(coeff_size, coeff_size), mode='bilinear', align_corners=False).squeeze().clamp(min=1.0)
+                else:
+                    resized_q_table = q_table
+                dequantized_part = dequantized_part * resized_q_table
+
+            dequantized_coeffs.append(dequantized_part.numpy())
+
+        # Reconstruct with all four de-quantized coefficients
+        LL, LH, HL, HH = dequantized_coeffs
+        coeffs = LL, (LH, HL, HH)
         reconstructed_patch = torch.from_numpy(pywt.idwt2(coeffs, 'haar'))
+        
+        # Resize to original patch size
         reconstructed_patch = F.interpolate(
             reconstructed_patch.unsqueeze(0).unsqueeze(0),
             size=(original_patch_size, original_patch_size),
             mode='bilinear', align_corners=False
         ).squeeze()
+        
         reconstructed_patches_list.append(reconstructed_patch)
         
     return torch.stack(reconstructed_patches_list)

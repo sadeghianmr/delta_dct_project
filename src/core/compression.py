@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Tuple
 from scipy.fftpack import dctn
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 
 def tensor_to_patches(delta_tensor: torch.Tensor, patch_size: int) -> torch.Tensor:
     """
@@ -111,45 +111,71 @@ def dct_and_quantize_patches(patches_tensor: torch.Tensor, bit_allocations: torc
 
     return quantized_patches_list, min_vals, max_vals
 
-def dwt_and_quantize_patches(patches_tensor: torch.Tensor, bit_allocations: torch.Tensor,
-                             q_table: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Applies DWT and quantization, with optional JPEG-style quantization."""
+
+def dwt_and_quantize_patches(
+    patches_tensor: torch.Tensor,
+    bit_allocations: torch.Tensor,
+    q_table: Optional[torch.Tensor] = None
+) -> Tuple[List[Any], torch.Tensor, torch.Tensor]:
+    """
+    Applies 2D DWT and quantizes ALL coefficients (LL, LH, HL, HH) with
+    asymmetrical bit-rates for a balance of accuracy and compression.
+    """
     num_patches = patches_tensor.shape[0]
-    quantized_patches_list = []
-    min_vals = torch.zeros(num_patches, dtype=torch.float32)
-    max_vals = torch.zeros(num_patches, dtype=torch.float32)
+    quantized_coeffs_list = [] 
+    min_vals_list = []
+    max_vals_list = []
+    
     patches_tensor = patches_tensor.float()
 
     for i in range(num_patches):
         patch = patches_tensor[i]
-        bits = bit_allocations[i].item()
+        allocated_bits_for_ll = bit_allocations[i].item()
+
         coeffs = pywt.dwt2(patch.numpy(), 'haar')
         LL, (LH, HL, HH) = coeffs
-        dwt_patch = torch.from_numpy(LL).float()
+        
+        dwt_patches = [torch.from_numpy(c).float() for c in [LL, LH, HL, HH]]
+        
+        # Asymmetrical Bit-rate Logic
+        bits_for_parts = [allocated_bits_for_ll, 1, 1, 1]
 
-        # --- NEW: Apply JPEG quantization table if provided ---
-        if q_table is not None:
-            # print(f"DEBUG: Applying JPEG Quantization Table in DWT...") # DEBUG PRINT
-            dwt_patch_size = dwt_patch.shape[0]
-            if q_table.shape[0] != dwt_patch_size:
-                resized_q_table = F.interpolate(q_table.view(1, 1, *q_table.shape), size=(dwt_patch_size, dwt_patch_size), mode='bilinear').squeeze().clamp(min=1.0)
-            else:
-                resized_q_table = q_table
-            dwt_patch = dwt_patch / resized_q_table
+        quantized_parts = []
+        min_vals_parts = []
+        max_vals_parts = []
 
-        if bits > 0:
-            min_val, max_val = dwt_patch.min(), dwt_patch.max()
-            min_vals[i], max_vals[i] = min_val, max_val
-            if min_val == max_val:
-                quantized = torch.zeros_like(dwt_patch, dtype=torch.int8)
-            else:
-                normalized = (dwt_patch - min_val) / (max_val - min_val)
-                scaled = normalized * (2**bits - 1)
-                quantized = torch.round(scaled).to(torch.int8)
-            quantized_patches_list.append(quantized)
-        else:
-            avg_val = patch.mean()
-            min_vals[i], max_vals[i] = avg_val, avg_val
-            quantized_patches_list.append(torch.zeros_like(dwt_patch, dtype=torch.int8))
+        for j, coeff_patch in enumerate(dwt_patches):
+            current_bits = bits_for_parts[j]
+            temp_patch = coeff_patch
+            
+            if q_table is not None:
+                coeff_size = temp_patch.shape[0]
+                if q_table.shape[0] != coeff_size:
+                    resized_q_table = F.interpolate(q_table.view(1, 1, *q_table.shape), size=(coeff_size, coeff_size), mode='bilinear', align_corners=False).squeeze().clamp(min=1.0)
+                else:
+                    resized_q_table = q_table
+                temp_patch = temp_patch / resized_q_table
 
-    return quantized_patches_list, min_vals, max_vals
+            if current_bits > 0:
+                min_val, max_val = temp_patch.min(), temp_patch.max()
+                if min_val == max_val:
+                    quantized = torch.zeros_like(temp_patch, dtype=torch.int8)
+                else:
+                    normalized = (temp_patch - min_val) / (max_val - min_val)
+                    scaled = normalized * (2**current_bits - 1)
+                    quantized = torch.round(scaled).to(torch.int8)
+                
+                quantized_parts.append(quantized)
+                min_vals_parts.append(min_val)
+                max_vals_parts.append(max_val)
+            else: # bits == 0
+                avg_val = temp_patch.mean()
+                quantized_parts.append(torch.zeros_like(temp_patch, dtype=torch.int8))
+                min_vals_parts.append(avg_val)
+                max_vals_parts.append(avg_val)
+
+        quantized_coeffs_list.append(quantized_parts)
+        min_vals_list.append(torch.tensor(min_vals_parts))
+        max_vals_list.append(torch.tensor(max_vals_parts))
+
+    return quantized_coeffs_list, torch.stack(min_vals_list), torch.stack(max_vals_list)

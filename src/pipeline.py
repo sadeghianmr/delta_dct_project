@@ -16,7 +16,7 @@ from core.decompression import (
     dequantize_and_idct_patches,
     dequantize_and_idwt_patches,
     patches_to_tensor,
-    final_rescale # We keep the import but won't use it in the main path
+    final_rescale
 )
 
 def compress_model(
@@ -28,7 +28,8 @@ def compress_model(
     q_table: Optional[torch.Tensor] = None
 ) -> Dict[str, Any]:
     """
-    Runs the complete compression pipeline on an entire model.
+    Runs the complete compression pipeline on an entire model. It correctly handles
+    compressible and non-compressible layers.
     """
     print(f"Starting model compression using transform: {transform_type.upper()}...")
     
@@ -50,10 +51,14 @@ def compress_model(
             scores = calculate_importance_scores(patches)
             bits = allocate_bit_widths(scores, bit_strategy)
             
+            q_table_for_layer = None
+            if q_table is not None:
+                q_table_for_layer = get_jpeg_quantization_table(patch_size)
+            
             if transform_type == 'dwt':
-                quantized_patches, min_vals, max_vals = dwt_and_quantize_patches(patches, bits, q_table=q_table)
-            else:
-                quantized_patches, min_vals, max_vals = dct_and_quantize_patches(patches, bits, q_table=q_table)
+                quantized_patches, min_vals, max_vals = dwt_and_quantize_patches(patches, bits, q_table=q_table_for_layer)
+            else: # Default to DCT
+                quantized_patches, min_vals, max_vals = dct_and_quantize_patches(patches, bits, q_table=q_table_for_layer)
             
             compressed_model_data[layer_name] = {
                 'is_compressed': True,
@@ -64,6 +69,7 @@ def compress_model(
                 'bit_allocations': bits,
                 'original_shape': delta_tensor.shape,
                 'patch_size': patch_size,
+                'original_mean_abs': torch.mean(torch.abs(delta_tensor)).item()
             }
         else:
             print(f"Skipping compression for layer '{layer_name}'. Storing uncompressed.")
@@ -116,16 +122,13 @@ def decompress_model(
                 reconstructed_patches, layer_data['original_shape'], layer_data['patch_size']
             )
             
-            # --- THE FINAL FIX: A More Stable Reconstruction Method ---
-            # Instead of using final_rescale, we add the reconstructed delta
-            # to the original pre-trained weights to get the final fine-tuned weights.
-            # This is mathematically more stable than adding to a deepcopy.
+            # A more stable reconstruction method
             with torch.no_grad():
                 original_pretrained_weight = pretrained_model.state_dict()[layer_name]
                 reconstructed_finetuned_weight = original_pretrained_weight.float() + reconstructed_delta.to(original_pretrained_weight.device)
                 reconstructed_model.state_dict()[layer_name].data.copy_(reconstructed_finetuned_weight)
         else:
-            # For non-compressed layers, we directly copy the weights for perfect accuracy.
+            # For non-compressed layers, directly copy the weights for perfect accuracy.
             print(f"Directly transferring weights for layer: {layer_name}...")
             with torch.no_grad():
                 reconstructed_model.state_dict()[layer_name].data.copy_(finetuned_state_dict[layer_name].data)
