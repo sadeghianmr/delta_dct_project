@@ -1,3 +1,4 @@
+import pywt
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple
@@ -112,5 +113,53 @@ def dct_and_quantize_patches(patches_tensor: torch.Tensor, bit_allocations: torc
             avg_val = patch.mean()
             min_vals[i], max_vals[i] = avg_val, avg_val
             quantized_patches_list.append(torch.zeros_like(patch, dtype=torch.int8))
+
+    return quantized_patches_list, min_vals, max_vals
+
+def dwt_and_quantize_patches(patches_tensor: torch.Tensor, bit_allocations: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Applies 2D Discrete Wavelet Transform (DWT) and then quantizes each patch
+    based on its allocated bit-width.
+
+    Args:
+        patches_tensor (torch.Tensor): The 3D tensor of patches to be compressed.
+        bit_allocations (torch.Tensor): The 1D tensor of bit-widths for each patch.
+
+    Returns:
+        Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]: A tuple containing:
+            - A list of quantized DWT patches (integer type).
+            - A 1D tensor of the minimum values for each patch's range.
+            - A 1D tensor of the maximum values for each patch's range.
+    """
+    num_patches = patches_tensor.shape[0]
+    quantized_patches_list = []
+    min_vals = torch.zeros(num_patches, dtype=torch.float32)
+    max_vals = torch.zeros(num_patches, dtype=torch.float32)
+
+    patches_tensor = patches_tensor.float()
+
+    for i in range(num_patches):
+        patch = patches_tensor[i]
+        bits = bit_allocations[i].item()
+
+        # Apply 2D DWT using the 'haar' wavelet
+        coeffs = pywt.dwt2(patch.numpy(), 'haar')
+        LL, (LH, HL, HH) = coeffs
+        dwt_patch = torch.from_numpy(LL).float() # We will only compress the approximation coefficients (LL)
+
+        if bits > 0:
+            min_val, max_val = dwt_patch.min(), dwt_patch.max()
+            min_vals[i], max_vals[i] = min_val, max_val
+            if min_val == max_val:
+                quantized = torch.zeros_like(dwt_patch, dtype=torch.int8)
+            else:
+                normalized = (dwt_patch - min_val) / (max_val - min_val)
+                scaled = normalized * (2**bits - 1)
+                quantized = torch.round(scaled).to(torch.int8)
+            quantized_patches_list.append(quantized)
+        else: # bits == 0
+            avg_val = patch.float().mean()
+            min_vals[i], max_vals[i] = avg_val, avg_val
+            quantized_patches_list.append(torch.zeros_like(dwt_patch, dtype=torch.int8))
 
     return quantized_patches_list, min_vals, max_vals

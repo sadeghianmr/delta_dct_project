@@ -1,38 +1,50 @@
 import torch
 import copy
 from typing import Dict, Any, List, Tuple
+from torch.nn import Module
 
+# Import all necessary building blocks
 from utils import calculate_delta_parameters
 from core.compression import (
     tensor_to_patches,
     calculate_importance_scores,
     allocate_bit_widths,
-    dct_and_quantize_patches
+    dct_and_quantize_patches,
+    dwt_and_quantize_patches  # Import the new DWT function
 )
 from core.decompression import (
     dequantize_and_idct_patches,
+    dequantize_and_idwt_patches, # Import the new IDWT function
     patches_to_tensor,
     final_rescale
 )
 
 def compress_model(
-    pretrained_model: torch.nn.Module,
-    finetuned_model: torch.nn.Module,
+    pretrained_model: Module,
+    finetuned_model: Module,
     patch_size: int,
-    bit_strategy: List[Tuple[int, float]]
+    bit_strategy: List[Tuple[int, float]],
+    transform_type: str = 'dct'  # New parameter to choose transform
 ) -> Dict[str, Any]:
     """
-    Runs the complete Delta-DCT compression pipeline on an entire model.
-    It now handles non-2D tensors and sensitive final layers by passing them through uncompressed.
+    Runs the complete compression pipeline on an entire model, using either DCT or DWT.
+
+    Args:
+        pretrained_model (torch.nn.Module): The original pre-trained model.
+        finetuned_model (torch.nn.Module): The fine-tuned model.
+        patch_size (int): The size of the patches for processing tensors.
+        bit_strategy (List[Tuple[int, float]]): The mixed-precision allocation strategy.
+        transform_type (str): The transform to use, either 'dct' or 'dwt'.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the compressed data for each layer.
     """
-    print("Starting model compression...")
+    print(f"Starting model compression using transform: {transform_type.upper()}...")
     
     delta_weights = calculate_delta_parameters(pretrained_model, finetuned_model)
     compressed_model_data = {}
     
     for layer_name, delta_tensor in delta_weights.items():
-        # --- FIX IS HERE ---
-        # Add a check to avoid compressing the sensitive final classifier/pooler layers.
         is_compressible = (
             delta_tensor.dim() == 2 and 
             'classifier' not in layer_name and 
@@ -46,10 +58,16 @@ def compress_model(
             patches = tensor_to_patches(delta_tensor, patch_size)
             scores = calculate_importance_scores(patches)
             bits = allocate_bit_widths(scores, bit_strategy)
-            quantized_patches, min_vals, max_vals = dct_and_quantize_patches(patches, bits)
+            
+            # --- CHOOSE TRANSFORM BASED ON PARAMETER ---
+            if transform_type == 'dwt':
+                quantized_patches, min_vals, max_vals = dwt_and_quantize_patches(patches, bits)
+            else: # Default to DCT
+                quantized_patches, min_vals, max_vals = dct_and_quantize_patches(patches, bits)
             
             compressed_model_data[layer_name] = {
                 'is_compressed': True,
+                'transform_type': transform_type, # Store the transform type
                 'quantized_patches': quantized_patches,
                 'min_vals': min_vals,
                 'max_vals': max_vals,
@@ -59,7 +77,6 @@ def compress_model(
                 'original_mean_abs': torch.mean(torch.abs(delta_tensor)).item()
             }
         else:
-            # Otherwise, store the delta uncompressed.
             print(f"Skipping compression for layer '{layer_name}'. Storing uncompressed.")
             compressed_model_data[layer_name] = {
                 'is_compressed': False,
@@ -70,13 +87,11 @@ def compress_model(
     return compressed_model_data
 
 def decompress_model(
-    pretrained_model: torch.nn.Module,
+    pretrained_model: Module,
     compressed_data: Dict[str, Any]
-) -> torch.nn.Module:
+) -> Module:
     """
-
     Reconstructs a fine-tuned model from compressed delta data.
-    It handles both compressed and uncompressed deltas.
     """
     print("Starting model decompression...")
     reconstructed_model = copy.deepcopy(pretrained_model)
@@ -85,10 +100,21 @@ def decompress_model(
         final_delta = None
         if layer_data['is_compressed']:
             print(f"Decompressing layer: {layer_name}...")
-            reconstructed_patches = dequantize_and_idct_patches(
-                layer_data['quantized_patches'], layer_data['min_vals'],
-                layer_data['max_vals'], layer_data['bit_allocations']
-            )
+            transform_type = layer_data.get('transform_type', 'dct')
+            
+            # --- CHOOSE INVERSE TRANSFORM ---
+            if transform_type == 'dwt':
+                reconstructed_patches = dequantize_and_idwt_patches(
+                    layer_data['quantized_patches'], layer_data['min_vals'],
+                    layer_data['max_vals'], layer_data['bit_allocations'],
+                    layer_data['patch_size']
+                )
+            else:
+                reconstructed_patches = dequantize_and_idct_patches(
+                    layer_data['quantized_patches'], layer_data['min_vals'],
+                    layer_data['max_vals'], layer_data['bit_allocations']
+                )
+            
             reconstructed_delta = patches_to_tensor(
                 reconstructed_patches, layer_data['original_shape'], layer_data['patch_size']
             )
@@ -100,10 +126,7 @@ def decompress_model(
         with torch.no_grad():
             param = reconstructed_model.state_dict()[layer_name]
             target_device = param.device
-
-            ## Fix
-            param.data = param.data.float()  
-            param.data += final_delta.to(target_device) # Reverted to simple addition
+            param.data = (param.data.float() + final_delta.to(target_device))
 
     print("\nModel decompression finished.")
     return reconstructed_model
