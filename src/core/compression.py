@@ -47,6 +47,33 @@ def calculate_importance_scores(patches_tensor: torch.Tensor) -> torch.Tensor:
     scores = torch.linalg.norm(flattened_patches, ord=2, dim=1)
     return scores
 
+def calculate_post_transform_scores(transformed_patches: torch.Tensor, energy_size: int = 4) -> torch.Tensor:
+    """
+    Calculates importance score based on the energy in the top-left (low-frequency)
+    corner of a transformed patch (post-transform).
+
+    Args:
+        transformed_patches (torch.Tensor): A 3D tensor of patches that have already
+                                            undergone DCT or DWT.
+        energy_size (int): The size of the top-left square to consider for energy calculation.
+
+    Returns:
+        torch.Tensor: A 1D tensor of importance scores.
+    """
+    if transformed_patches.dim() != 3:
+        raise ValueError("Input must be a 3D tensor of transformed patches.")
+    
+    # Take the top-left corner of each patch (e.g., a 4x4 sub-matrix)
+    low_freq_coeffs = transformed_patches[:, :energy_size, :energy_size]
+    
+    # Flatten this corner for each patch
+    flattened_coeffs = low_freq_coeffs.contiguous().view(low_freq_coeffs.shape[0], -1)
+    
+    # Calculate the L2 norm (energy) of this corner
+    scores = torch.linalg.norm(flattened_coeffs, ord=2, dim=1)
+    return scores
+
+
 def allocate_bit_widths(scores: torch.Tensor, allocation_map: List[Tuple[int, float]]) -> torch.Tensor:
     """
     Allocates quantization bit-widths to patches based on their importance scores.
@@ -115,14 +142,14 @@ def dct_and_quantize_patches(patches_tensor: torch.Tensor, bit_allocations: torc
 def dwt_and_quantize_patches(
     patches_tensor: torch.Tensor,
     bit_allocations: torch.Tensor,
-    q_table: Optional[torch.Tensor] = None
+    q_table: Optional[torch.Tensor] = None,
+    coeffs_to_keep: str = 'all'  # NEW: Parameter to control which coeffs to save
 ) -> Tuple[List[Any], torch.Tensor, torch.Tensor]:
     """
-    Applies 2D DWT and quantizes ALL coefficients (LL, LH, HL, HH) with
-    asymmetrical bit-rates for a balance of accuracy and compression.
+    Applies DWT and quantizes a selected set of coefficients based on the coeffs_to_keep strategy.
     """
     num_patches = patches_tensor.shape[0]
-    quantized_coeffs_list = [] 
+    quantized_coeffs_list = []
     min_vals_list = []
     max_vals_list = []
     
@@ -135,15 +162,25 @@ def dwt_and_quantize_patches(
         coeffs = pywt.dwt2(patch.numpy(), 'haar')
         LL, (LH, HL, HH) = coeffs
         
-        dwt_patches = [torch.from_numpy(c).float() for c in [LL, LH, HL, HH]]
+        # --- NEW LOGIC: Select which coefficients to process ---
+        all_coeffs_map = {'LL': LL, 'LH': LH, 'HL': HL, 'HH': HH}
         
-        # Asymmetrical Bit-rate Logic
+        if coeffs_to_keep == 'll_only':
+            coeffs_map_to_process = {'LL': LL}
+        elif coeffs_to_keep == 'll_lh_hl':
+            coeffs_map_to_process = {'LL': LL, 'LH': LH, 'HL': HL}
+        else:  # Default to 'all'
+            coeffs_map_to_process = all_coeffs_map
+
+        dwt_patches = [torch.from_numpy(c).float() for c in coeffs_map_to_process.values()]
+        
         bits_for_parts = [allocated_bits_for_ll, 1, 1, 1]
 
         quantized_parts = []
         min_vals_parts = []
         max_vals_parts = []
 
+        # This loop now iterates over only the selected coefficients
         for j, coeff_patch in enumerate(dwt_patches):
             current_bits = bits_for_parts[j]
             temp_patch = coeff_patch

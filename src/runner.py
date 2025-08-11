@@ -87,10 +87,14 @@ def run_classification_experiment(config: Dict[str, Any], device: str = "cpu") -
         print("JPEG-style quantization ENABLED.")
         q_table = get_jpeg_quantization_table(8)
     
+    # --- NEW: Get the DWT strategy from the config ---
+    dwt_coeffs_strategy = config.get("dwt_coeffs_to_keep", "all")
+    
     compressed_data = compress_model(
         pt_model, ft_model, config['patch_size'],
         config['bit_strategy'], transform_type=transform_type,
-        q_table=q_table
+        q_table=q_table,
+        dwt_coeffs_to_keep=dwt_coeffs_strategy # Pass the new parameter
     )
     
     reconstructed_model = decompress_model(
@@ -109,6 +113,7 @@ def run_classification_experiment(config: Dict[str, Any], device: str = "cpu") -
     results = {
         "model_name": config['finetuned_model_id'].split('/')[-1],
         "transform": transform_type,
+        "dwt_coeffs_kept": dwt_coeffs_strategy, # Add to results for clarity
         "jpeg_quant": use_jpeg_quant,
         "patch_size": config['patch_size'],
         "bit_strategy": str(config['bit_strategy']),

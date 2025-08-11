@@ -1,7 +1,10 @@
+import pywt
+from scipy.fftpack import dctn
 import torch
 import copy
 from typing import Dict, Any, List, Tuple, Optional
 from torch.nn import Module
+import torch.nn.functional as F
 
 # Import all necessary building blocks
 from utils import calculate_delta_parameters, get_jpeg_quantization_table
@@ -10,7 +13,8 @@ from core.compression import (
     calculate_importance_scores,
     allocate_bit_widths,
     dct_and_quantize_patches,
-    dwt_and_quantize_patches
+    dwt_and_quantize_patches,
+    calculate_post_transform_scores
 )
 from core.decompression import (
     dequantize_and_idct_patches,
@@ -25,11 +29,11 @@ def compress_model(
     patch_size: int,
     bit_strategy: List[Tuple[int, float]],
     transform_type: str = 'dct',
-    q_table: Optional[torch.Tensor] = None
+    q_table: Optional[torch.Tensor] = None,
+    dwt_coeffs_to_keep: str = 'all' # NEW: Argument to pass down
 ) -> Dict[str, Any]:
     """
-    Runs the complete compression pipeline on an entire model. It correctly handles
-    compressible and non-compressible layers.
+    Runs the complete compression pipeline, with a strategy for which DWT coeffs to keep.
     """
     print(f"Starting model compression using transform: {transform_type.upper()}...")
     
@@ -56,13 +60,17 @@ def compress_model(
                 q_table_for_layer = get_jpeg_quantization_table(patch_size)
             
             if transform_type == 'dwt':
-                quantized_patches, min_vals, max_vals = dwt_and_quantize_patches(patches, bits, q_table=q_table_for_layer)
-            else: # Default to DCT
+                # Pass the new parameter to the core function
+                quantized_patches, min_vals, max_vals = dwt_and_quantize_patches(
+                    patches, bits, q_table=q_table_for_layer, coeffs_to_keep=dwt_coeffs_to_keep
+                )
+            else:
                 quantized_patches, min_vals, max_vals = dct_and_quantize_patches(patches, bits, q_table=q_table_for_layer)
             
             compressed_model_data[layer_name] = {
                 'is_compressed': True,
                 'transform_type': transform_type,
+                'dwt_coeffs_to_keep': dwt_coeffs_to_keep, # Store for the decompressor
                 'quantized_patches': quantized_patches,
                 'min_vals': min_vals,
                 'max_vals': max_vals,
@@ -80,6 +88,7 @@ def compress_model(
 
     print("\nModel compression finished.")
     return compressed_model_data
+
 
 def decompress_model(
     pretrained_model: Module,
