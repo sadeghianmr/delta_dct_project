@@ -1,6 +1,6 @@
 # Delta-DCT: Data-Free Delta Compression for Fine-Tuned Models
 
-This project implements and extends the Delta-DCT compression method for fine-tuned neural networks, inspired by the work of **Huang, Chenyu et al. (2025## 🚧 Limitations & Future Work. "Seeing Delta Parameters as JPEG Images: Data-Free Delta Compression with Discrete Cosine Transform."** [arXiv Paper](https://arxiv.org/abs/2503.06676)
+This project implements and extends the Delta-DCT compression method for fine-tuned neural networks, inspired by the work of **Huang, Chenyu et al. ("Seeing Delta Parameters as JPEG Images: Data-Free Delta Compression with Discrete Cosine Transform."** [arXiv Paper](https://arxiv.org/abs/2503.06676)
 
 ## 📋 Overview
 
